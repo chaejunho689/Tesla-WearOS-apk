@@ -1,6 +1,6 @@
 # Tesla WearOS — Galaxy Watch Native App
 
-Tesla Fleet API 기반 브릿지 서버에 연결하는 Galaxy Watch 6 전용 네이티브 Wear OS 앱입니다.
+Tesla Fleet API 기반 브릿지 서버에 연결하는 네이티브 Google Wear OS 앱입니다.
 
 ---
 
