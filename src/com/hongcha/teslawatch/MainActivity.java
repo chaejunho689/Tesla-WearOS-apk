@@ -4,9 +4,8 @@ import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.animation.ValueAnimator;
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.Context;
-import android.content.DialogInterface;
+import android.content.SharedPreferences;
 import android.os.Build;
 import android.widget.Toast;
 import android.window.OnBackInvokedCallback;
@@ -17,6 +16,9 @@ import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.Typeface;
+import android.view.MotionEvent;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.InsetDrawable;
@@ -87,6 +89,9 @@ public class MainActivity extends Activity {
     private BatteryView battery;
     private TextView battText;
     private int lastSoc = -1;
+    private int lastRangeKm = -1;            // 남은 주행거리 (km)
+    private boolean showRange = false;       // false=배터리% / true=주행거리km
+    private SharedPreferences prefs;
     private DashLine dashCtl, dashStat, dashHvac;
     private TextView lblCtl, lblStat, lblHvac;
 
@@ -106,12 +111,16 @@ public class MainActivity extends Activity {
     private ImageView hvacOn;                                // 공조 ON 배경(페이드용 오버레이)
     private boolean stClimate = false;                       // 공조 ON 여부
 
+    private WaterOverlay waterOv;                            // 롱프레스 물 차오름
+
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
 
         BASE = getString(R.string.bridge_base);
         KEY  = getString(R.string.bridge_key);
+        prefs = getSharedPreferences("watch_prefs", MODE_PRIVATE);
+        showRange = prefs.getBoolean("show_range", false);
         S = getResources().getDisplayMetrics().widthPixels / 480f;
 
         root = new FrameLayout(this);
@@ -143,6 +152,12 @@ public class MainActivity extends Activity {
                         }
                     });
         }
+
+        // 물 오버레이 (프렁크/트렁크 롱프레스 시 아래→위 차오름)
+        waterOv = new WaterOverlay(this);
+        waterOv.setVisibility(View.GONE);
+        root.addView(waterOv, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         show(0);   // 초기 진입도 오버레이 페이드 인
         fetchState();
@@ -226,6 +241,15 @@ public class MainActivity extends Activity {
         battText.setTypeface(battText.getTypeface(), android.graphics.Typeface.BOLD);
         battText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 23 * S);
         mainOverlay.addView(battText, lp(180, 40, 120, 32));
+
+        // 배터리 아이콘 + 숫자 영역 탭 → % ↔ km 토글 (라벨보다 먼저 추가하여 라벨이 위에)
+        View battTap = new View(this);
+        // 알약형 리플 (좌우 여백 있어 예쁘게 hugs the 배터리+숫자)
+        battTap.setBackground(pillRipple(Math.round(8 * S), Math.round(6 * S)));
+        battTap.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { toggleBattDisplay(); }
+        });
+        mainOverlay.addView(battTap, lp(180, 12, 120, 62));
 
         // 점선들 (차량 → 글자). 제어/상태는 아래→위, 공조는 위→아래로 자람
         dashCtl  = new DashLine(this, false); mainOverlay.addView(dashCtl,  lp(78, 134, 4, 120));
@@ -316,8 +340,25 @@ public class MainActivity extends Activity {
 
     private void renderMain() {
         if (battText == null) return;
-        battText.setText((lastSoc >= 0 ? lastSoc : "–") + "%");
+        battText.setText(battLabel());
         if (battery != null) battery.setLevel(lastSoc);
+    }
+
+    private String battLabel() {
+        if (showRange) return (lastRangeKm >= 0 ? lastRangeKm : "–") + "km";
+        return (lastSoc >= 0 ? lastSoc : "–") + "%";
+    }
+
+    private void toggleBattDisplay() {
+        showRange = !showRange;
+        if (prefs != null) prefs.edit().putBoolean("show_range", showRange).apply();
+        if (battText == null) return;
+        battText.animate().alpha(0f).setDuration(140).withEndAction(new Runnable() {
+            @Override public void run() {
+                battText.setText(battLabel());
+                battText.animate().alpha(1f).setDuration(140).start();
+            }
+        }).start();
     }
 
     // ═══════════ 화면2: 제어 ═══════════
@@ -332,9 +373,9 @@ public class MainActivity extends Activity {
         // 아이콘 크기는 유지, 클릭영역만 15% 크게 (addIcon) + 누를 때 흰 원형 리플
         icFrunk = iconConfirm(R.drawable.ic_frunk, "프렁크를", "프렁크", "/api/trunk?which=front");
         addIcon(controlOverlay, icFrunk, 240, 62, 56);    // 맨 위 중앙
-        icDoor = iconBtn(R.drawable.ic_door, new Runnable(){ public void run(){ toggleLock(); } });
+        icDoor = iconHold(R.drawable.ic_door, new Runnable(){ public void run(){ toggleLock(); } });
         addIcon(controlOverlay, icDoor, 240, 240, 64);    // 정중앙
-        icCharge = iconBtn(R.drawable.ic_chargeport, new Runnable(){ public void run(){ toggleCharge(); } });
+        icCharge = iconHold(R.drawable.ic_chargeport, new Runnable(){ public void run(){ toggleCharge(); } });
         addIcon(controlOverlay, icCharge, 92, 320, 56);   // 좌측 2/3
         icTrunk = iconConfirm(R.drawable.ic_trunk, "트렁크를", "트렁크", "/api/trunk?which=rear");
         addIcon(controlOverlay, icTrunk, 240, 418, 56);   // 맨 아래 중앙
@@ -383,27 +424,254 @@ public class MainActivity extends Activity {
 
     /** 롱프레스로만 작동 + 확인창 (프렁크/트렁크 오작동 방지) */
     private ImageView iconConfirm(int res, final String what, final String label, final String path) {
+        final ImageView iv = new ImageView(this);
+        iv.setImageResource(res);
+        iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        iv.setColorFilter(C_OFF);
+        iv.setBackground(circleRipple());
+        attachHold(iv, new Runnable() {
+            @Override public void run() { showConfirmCard(what, label, path); }
+        }, true);
+        return iv;
+    }
+
+    /** 롱프레스 홀드로 즉시 실행 (확인창 없음). 짧게 뗄 때는 안내 알럿 표시. */
+    private ImageView iconHold(int res, final Runnable onComplete) {
         ImageView iv = new ImageView(this);
         iv.setImageResource(res);
         iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
         iv.setColorFilter(C_OFF);
         iv.setBackground(circleRipple());
-        iv.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { toast("길게 눌러 여세요"); }
-        });
-        iv.setOnLongClickListener(new View.OnLongClickListener() {
-            @Override public boolean onLongClick(View v) {
-                new AlertDialog.Builder(MainActivity.this)
-                        .setMessage(what + " 여시겠습니까?")
-                        .setPositiveButton("확인", new DialogInterface.OnClickListener() {
-                            @Override public void onClick(DialogInterface d, int w) { cmd(path, label); }
-                        })
-                        .setNegativeButton("취소", null)
-                        .show();
-                return true;
+        attachHold(iv, onComplete, true);
+        return iv;
+    }
+
+    /** 뷰에 물 차오름 홀드 동작 부착. showAlertOnFail=true면 짧게 뗄 때 "길게 눌러서 실행" 표시 */
+    private void attachHold(View v, final Runnable onComplete, final boolean showAlertOnFail) {
+        v.setOnTouchListener(new View.OnTouchListener() {
+            @Override public boolean onTouch(View vv, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        vv.setPressed(true);
+                        waterOv.start(onComplete);
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        vv.setPressed(false);
+                        boolean incomplete = waterOv.progress < 0.99f;
+                        waterOv.cancel();
+                        if (incomplete && showAlertOnFail) showCenterAlert("길게 눌러서 실행");
+                        return true;
+                }
+                return false;
             }
         });
-        return iv;
+    }
+
+    /** 커스텀 확인 카드 — 검정 라운드 배경, 알약 버튼 */
+    private void showConfirmCard(String what, final String label, final String path) {
+        final FrameLayout dim = new FrameLayout(this);
+        dim.setBackgroundColor(Color.parseColor("#b0000000"));
+        dim.setClickable(true);
+
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setGravity(Gravity.CENTER);
+        GradientDrawable cbg = new GradientDrawable();
+        cbg.setColor(Color.parseColor("#1e1f21"));
+        cbg.setCornerRadius(28 * S);
+        card.setBackground(cbg);
+        int pad = Math.round(22 * S);
+        card.setPadding(pad, pad, pad, pad);
+
+        TextView msg = new TextView(this);
+        msg.setText(what + " 여시겠습니까?");
+        msg.setTextColor(Color.parseColor("#f2f2f2"));
+        msg.setGravity(Gravity.CENTER);
+        msg.setTextSize(TypedValue.COMPLEX_UNIT_PX, 26 * S);
+        msg.setTypeface(msg.getTypeface(), Typeface.BOLD);
+        card.addView(msg, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout btnRow = new LinearLayout(this);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        rowLp.topMargin = Math.round(18 * S);
+        card.addView(btnRow, rowLp);
+
+        TextView cancelBtn = pillBtn("취소", Color.parseColor("#3a3b3d"), Color.parseColor("#f2f2f2"));
+        TextView okBtn     = pillBtn("확인", Color.parseColor("#e8501c"), Color.WHITE);
+        LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(
+                0, Math.round(58 * S), 1f);
+        bLp.setMargins(Math.round(5 * S), 0, Math.round(5 * S), 0);
+        btnRow.addView(cancelBtn, bLp);
+        btnRow.addView(okBtn, bLp);
+
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(
+                Math.round(360 * S), FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+        dim.addView(card, cardLp);
+
+        dim.setAlpha(0f);
+        root.addView(dim, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        dim.animate().alpha(1f).setDuration(180).start();
+
+        final Runnable dismiss = new Runnable() {
+            @Override public void run() {
+                dim.animate().alpha(0f).setDuration(180).withEndAction(new Runnable() {
+                    @Override public void run() { root.removeView(dim); }
+                }).start();
+            }
+        };
+        cancelBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { dismiss.run(); waterOv.fadeOut(); }
+        });
+        okBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { dismiss.run(); waterOv.fadeOut(); cmd(path, label); }
+        });
+    }
+
+    /** 상단에 잠깐 뜨는 인라인 알림 (온도 조절 힌트 등) */
+    private void showTopAlert(String msg) {
+        showAlertAt(msg, Gravity.TOP | Gravity.CENTER_HORIZONTAL, Math.round(50 * S));
+    }
+
+    /** 중앙에 잠깐 뜨는 인라인 알림 (Toast 대신 커스텀 라운드 카드) */
+    private void showCenterAlert(String msg) {
+        showAlertAt(msg, Gravity.CENTER, 0);
+    }
+
+    private void showAlertAt(String msg, int gravity, int topMargin) {
+        final TextView tv = new TextView(this);
+        tv.setText(msg);
+        tv.setTextColor(Color.parseColor("#f2f2f2"));
+        tv.setGravity(Gravity.CENTER);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, 24 * S);
+        tv.setTypeface(tv.getTypeface(), Typeface.BOLD);
+        int hpad = Math.round(28 * S), vpad = Math.round(18 * S);
+        tv.setPadding(hpad, vpad, hpad, vpad);
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(Color.parseColor("#d8000000"));
+        d.setCornerRadius(28 * S);
+        tv.setBackground(d);
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT, gravity);
+        lp.topMargin = topMargin;
+        tv.setAlpha(0f);
+        root.addView(tv, lp);
+        tv.animate().alpha(1f).setDuration(150).start();
+
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                tv.animate().alpha(0f).setDuration(200).withEndAction(new Runnable() {
+                    @Override public void run() { root.removeView(tv); }
+                }).start();
+            }
+        }, 1200);
+    }
+
+    private TextView pillBtn(String text, int bg, int fg) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(fg);
+        t.setGravity(Gravity.CENTER);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_PX, 24 * S);
+        t.setTypeface(t.getTypeface(), Typeface.BOLD);
+        GradientDrawable d = new GradientDrawable();
+        d.setColor(bg);
+        d.setCornerRadius(30 * S);
+        t.setBackground(d);
+        t.setClickable(true);
+        return t;
+    }
+
+    /** 화면 전체를 덮는 물 오버레이 — 아래→위로 차오르고 sine wave로 살짝 출렁 */
+    private class WaterOverlay extends View {
+        private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private float progress = 0f;    // 0=비어있음 1=가득
+        private float phase = 0f;       // 파도 위상
+        private ValueAnimator fillAnim, waveAnim;
+        private Runnable onComplete;
+
+        WaterOverlay(Context ctx) {
+            super(ctx);
+            paint.setColor(Color.parseColor("#99b8bab9"));   // 반투명 연회색
+            paint.setStyle(Paint.Style.FILL);
+        }
+
+        void start(final Runnable done) {
+            onComplete = done;
+            setVisibility(View.VISIBLE);
+            setAlpha(1f);
+            progress = 0f;
+            if (fillAnim != null) fillAnim.cancel();
+            fillAnim = ValueAnimator.ofFloat(0f, 1f);
+            fillAnim.setDuration(1200);
+            fillAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                @Override public void onAnimationUpdate(ValueAnimator a) {
+                    progress = (Float) a.getAnimatedValue();
+                    invalidate();
+                }
+            });
+            fillAnim.addListener(new AnimatorListenerAdapter() {
+                @Override public void onAnimationEnd(Animator a) {
+                    if (progress >= 0.99f && onComplete != null) {
+                        Runnable r = onComplete; onComplete = null; r.run();
+                    }
+                }
+            });
+            fillAnim.start();
+
+            if (waveAnim == null || !waveAnim.isRunning()) {
+                waveAnim = ValueAnimator.ofFloat(0f, (float) (2 * Math.PI));
+                waveAnim.setDuration(1400);
+                waveAnim.setRepeatCount(ValueAnimator.INFINITE);
+                waveAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                    @Override public void onAnimationUpdate(ValueAnimator a) {
+                        phase = (Float) a.getAnimatedValue();
+                        if (progress > 0f) invalidate();
+                    }
+                });
+                waveAnim.start();
+            }
+        }
+
+        void cancel() {
+            if (fillAnim != null) fillAnim.cancel();
+            onComplete = null;
+            fadeOut();
+        }
+
+        void fadeOut() {
+            animate().alpha(0f).setDuration(280).withEndAction(new Runnable() {
+                @Override public void run() {
+                    setVisibility(View.GONE);
+                    progress = 0f;
+                    if (waveAnim != null) { waveAnim.cancel(); waveAnim = null; }
+                }
+            }).start();
+        }
+
+        @Override
+        protected void onDraw(Canvas cv) {
+            if (progress <= 0f) return;
+            int w = getWidth(), h = getHeight();
+            float top = h * (1f - progress);
+            float amp = 6f * S;
+            Path p = new Path();
+            p.moveTo(0, top);
+            for (int x = 0; x <= w; x += 6) {
+                float y = top + amp * (float) Math.sin((x / (float) w) * 4 * Math.PI + phase);
+                p.lineTo(x, y);
+            }
+            p.lineTo(w, h);
+            p.lineTo(0, h);
+            p.close();
+            cv.drawPath(p, paint);
+        }
     }
 
     private void toast(String msg) {
@@ -469,8 +737,10 @@ public class MainActivity extends Activity {
         tempText.setTypeface(tempText.getTypeface(), android.graphics.Typeface.BOLD);
         tempText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 30 * S);
         tempText.setText("–℃");
-        tempText.setOnClickListener(new View.OnClickListener(){ @Override public void onClick(View v){ applyClimate(); } });
-        tempText.setOnLongClickListener(new View.OnLongClickListener(){ @Override public boolean onLongClick(View v){ climateOff(); return true; } });
+        // 길게 눌러서 공조 ON/OFF 토글. 짧게 뗄 때는 안내 알럿
+        attachHold(tempText, new Runnable(){
+            @Override public void run(){ if (stClimate) climateOff(); else applyClimate(); }
+        }, true);
         hvacOverlay.addView(tempText, lp(180, 393, 120, 44));
 
         // 힌트: 공조 ON일 때만 "길게 눌러서 공조 끄기"
@@ -482,11 +752,11 @@ public class MainActivity extends Activity {
         hintText.setVisibility(View.GONE);
         hvacOverlay.addView(hintText, lp(120, 440, 240, 20));
 
-        // 온도 내림(좌, 180° 뒤집힘) / 올림(우, 정방향)
+        // 온도 내림(좌, 180° 뒤집힘) / 올림(우, 정방향) — 클릭 영역 46×46, 시각은 40×40 유지
         icArrowDown = arrowBtn(true);
-        hvacOverlay.addView(icArrowDown, lp(130, 395, 40, 40));
+        hvacOverlay.addView(icArrowDown, lp(127, 392, 46, 46));
         icArrowUp = arrowBtn(false);
-        hvacOverlay.addView(icArrowUp, lp(310, 395, 40, 40));
+        hvacOverlay.addView(icArrowUp, lp(307, 392, 46, 46));
 
         renderHvac();
     }
@@ -496,9 +766,24 @@ public class MainActivity extends Activity {
         iv.setImageResource(R.drawable.ic_arrow);
         iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
         iv.setColorFilter(C_ARROW);
+        int pad = Math.round(3 * S);   // 클릭 영역 46 - 시각 40 = 6 → padding 3
+        iv.setPadding(pad, pad, pad, pad);
         if (down) iv.setRotation(180);
-        iv.setOnClickListener(new View.OnClickListener(){ @Override public void onClick(View v){ adjustTemp(down ? -1 : 1); } });
+        iv.setOnClickListener(new View.OnClickListener(){ @Override public void onClick(View v){
+            adjustTemp(down ? -1 : 1);
+            if (stClimate) sendTemp(tempSet);
+            else showTopAlert("온도를 길게\n눌러서 공조 켜기");
+        } });
         return iv;
+    }
+
+    /** 공조 켜진 상태에서 온도 조절 즉시 전송 (Wake 없이 바로 set_temp) */
+    private void sendTemp(final int t) {
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try { httpPost(BASE + "/api/set_temp?celsius=" + t + "&key=" + KEY); } catch (Exception e) {}
+            }
+        }).start();
     }
 
     /** 시트/휠 히터 아이콘 (idx 0~4 시트, -1 휠) */
@@ -759,6 +1044,7 @@ public class MainActivity extends Activity {
         JSONObject cl = resp.optJSONObject("climate_state");
         if (cs != null) {
             if (cs.has("battery_level")) lastSoc = cs.optInt("battery_level", lastSoc);
+            if (cs.has("battery_range")) lastRangeKm = (int) Math.round(cs.optDouble("battery_range", 0) * MI);
             if (cs.has("charge_port_door_open")) stChargeOpen = cs.optBoolean("charge_port_door_open");
         }
         if (vs != null) {
