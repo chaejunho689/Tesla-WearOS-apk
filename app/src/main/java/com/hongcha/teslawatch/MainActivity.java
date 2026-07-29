@@ -49,7 +49,7 @@ public class MainActivity extends Activity {
     private String KEY;
 
     // 색상
-    private static final int BG      = Color.parseColor("#151515");
+    private static final int BG      = Color.parseColor("#161719");
     private static final int C_LABEL = Color.parseColor("#dcdcdc");
     private static final int C_DASH  = Color.parseColor("#7d7f7e");
     private static final int C_OUT   = Color.parseColor("#e8e8e8");
@@ -65,6 +65,13 @@ public class MainActivity extends Activity {
     private static final int C_S1    = Color.parseColor("#f0b060"); // 히터 1단
     private static final int C_S2    = Color.parseColor("#f08030"); // 히터 2단
     private static final int C_ARROW = Color.parseColor("#cfd1d0"); // 온도 화살표
+    private static final int C_BUSY  = Color.parseColor("#45484a"); // 명령 전송중(어두운 회색)
+
+    private volatile boolean cmdBusy = false;                       // 명령 전송중 재클릭 차단
+    private boolean swUpdateAvail = false;                          // 신규 소프트웨어 있음
+    private boolean swBannerShown = false;                          // 이번 메인 진입에 배너 표시함
+    private boolean lastAwake = false;                              // 차량 깨어있음(sleep/wifi 아이콘)
+    private ImageView statusIcon;                                   // 메인 하단 sleep/wifi
 
     private float S = 1f;                 // 480 디자인 → 실제 화면 스케일
     private final Handler ui = new Handler(Looper.getMainLooper());
@@ -72,12 +79,21 @@ public class MainActivity extends Activity {
     private static final double MI = 1.60934;             // mile → km
 
     private FrameLayout root;
-    private FrameLayout[] screen = new FrameLayout[4];    // 0=메인 1=제어 2=공조 3=상태
+    private FrameLayout[] screen = new FrameLayout[5];    // 0=메인 1=제어 2=공조 3=상태 4=충전
     private FrameLayout mainOverlay;                      // 메인 오버레이(점선/라벨/배터리) 페이드용
     private ImageView mainCarBg;                          // s1.png 차량이미지 — 첫 애니 단계
     private FrameLayout controlOverlay, hvacOverlay;      // 제어/공조 아이콘·글자 페이드용
     private boolean introPending = false;                 // 창이 보인 뒤 인트로 재생
     private int cur = 0;
+
+    // 화면5(충전)
+    private ImageView chgCarBg;                           // s5.png 차량이미지 — 첫 애니 단계
+    private FrameLayout chgOverlay;                       // 충전 정보(게이지 등) 페이드용
+    private DashLine dashOpen;                            // 충전구 → 번개아이콘 점선
+    private ImageView icOpen;                             // 번개(충전 잠금해제)
+    private TextView chgSoc, chgRange, chgLimitTxt, chgEta;
+    private ChargeBar chargeBar;                          // 게이지 + 드래그 노란원
+    private int chgLimitSel = 80;                         // 선택 충전 제한(50~100)
 
     // 화면4(상태)
     private ImageView statBg;
@@ -92,12 +108,34 @@ public class MainActivity extends Activity {
     private int lastRangeKm = -1;            // 남은 주행거리 (km)
     private boolean showRange = false;       // false=배터리% / true=주행거리km
     private SharedPreferences prefs;
-    private DashLine dashCtl, dashStat, dashHvac;
-    private TextView lblCtl, lblStat, lblHvac;
+    private DashLine dashCtl, dashStat, dashHvac, dashChg;
+    private TextView lblCtl, lblStat, lblHvac, lblChg;
+
+    // 충전 상태
+    private int lastLimit = 80;              // 차량의 현재 충전 제한
+    private int lastMinToFull = -1;          // 완충까지 분
+    private boolean stCharging = false;
+    private boolean stChargeComplete = false;
+    private String chargingState = "";       // "Charging"/"Complete"/"Stopped"/"NoPower"/"Disconnected"/"Starting"
+    private long chgAttemptTs = 0;           // 마지막 한도 변경 시각(실패 판정용)
+
+    /** 충전기 연결됨: Disconnected 외 모든 상태 */
+    private boolean chargerConnected() {
+        return chargingState != null && !chargingState.isEmpty() && !"Disconnected".equals(chargingState);
+    }
+    /** 완전 충전됨: "Complete" 상태에서만 (다른 조건은 실패로 간주) */
+    private boolean chargeDone() {
+        return "Complete".equals(chargingState);
+    }
+    /** 충전 불가: 연결됐는데 충전중/완료 아님 (Stopped/NoPower/Starting 등) */
+    private boolean chargeFailed() {
+        return chargerConnected() && !stCharging && !chargeDone();
+    }
 
     // 화면2(제어) 아이콘 + 상태 (null=미확인)
-    private ImageView icDoor, icFrunk, icTrunk, icCharge;
-    private Boolean stLocked, stFrunkOpen, stTrunkOpen, stChargeOpen;
+    private ImageView icDoor, icFrunk, icTrunk, icCharge, icSentry;
+    private Boolean stLocked, stFrunkOpen, stTrunkOpen, stChargeOpen, stSentry;
+    private boolean stSentryAvail = true;   // 센트리 켤 수 있음(저전력 모드면 false)
 
     // 화면3(공조)
     private ImageView icWheel, icArrowUp, icArrowDown;
@@ -128,18 +166,20 @@ public class MainActivity extends Activity {
         setContentView(root, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             screen[i] = new FrameLayout(this);
+            screen[i].setBackgroundColor(BG);   // 모든 화면 배경 통일 #161719
             screen[i].setVisibility(i == 0 ? View.VISIBLE : View.GONE);
             root.addView(screen[i], new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
-            if (i == 1) addBg(screen[i], "s2.png");   // 메인(0)/공조(2)/상태(3)는 각 build에서 처리
+            if (i == 1) addBg(screen[i], "s2.png");   // 메인(0)/공조(2)/상태(3)/충전(4)은 각 build에서 처리
         }
 
         buildMain();
         buildControl();
         buildHvac();
         buildStatus();
+        buildCharge();
 
         // Wear OS 4: 뒤로가기를 시스템이 가로채므로 콜백으로 직접 처리
         if (Build.VERSION.SDK_INT >= 33) {
@@ -159,21 +199,45 @@ public class MainActivity extends Activity {
         root.addView(waterOv, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
-        show(0);   // 초기 진입도 오버레이 페이드 인
+        int start = deepLinkScreen(getIntent());   // 타일/딥링크로 특정 화면 진입
+        show(start);
         fetchState();
         ui.postDelayed(refreshLoop, 60000);
     }
 
+    /** Intent extra "screen"(0~4) 또는 data 경로(teslawatch://screen/N)로 진입 화면 결정 */
+    private int deepLinkScreen(android.content.Intent it) {
+        if (it == null) return 0;
+        int s = it.getIntExtra("screen", -1);
+        if (s < 0 && it.getData() != null) {
+            try { s = Integer.parseInt(it.getData().getLastPathSegment()); } catch (Exception e) {}
+        }
+        return (s >= 0 && s <= 4) ? s : 0;
+    }
+
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        show(deepLinkScreen(intent));   // 이미 실행중이면 해당 화면으로 전환
+    }
+
     // ── 화면 전환 ──
     private void show(int idx) {
+        if (idx != 0) swBannerShown = false;   // 메인 재진입 시 배너 다시 표시 가능
         cur = idx;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             if (i == idx) {
                 if (i == 0) {
                     // 메인: bg는 즉시, 점선이 자라고 → 글자 페이드 인
                     screen[0].setAlpha(1f);
                     screen[0].setVisibility(View.VISIBLE);
                     startMainIntro();
+                } else if (i == 4) {
+                    // 충전: bg 즉시 → s5 페이드 → 점선/번개 → 글자 → 충전정보 페이드
+                    screen[4].setAlpha(1f);
+                    screen[4].setVisibility(View.VISIBLE);
+                    startChargeIntro();
                 } else {
                     // 제어/공조/상태: 배경 먼저 페이드 → 아이콘·글자 뒤이어 페이드
                     screen[i].setAlpha(0f);
@@ -189,7 +253,11 @@ public class MainActivity extends Activity {
                 screen[i].setVisibility(View.GONE);
             }
         }
-        if (idx == 0) renderMain();
+        // 서브화면에선 5초 폴링, 메인에선 정지
+        ui.removeCallbacks(fastLoop);
+        if (idx != 0) ui.postDelayed(fastLoop, 5000);
+
+        if (idx == 0) { renderMain(); fetchState(); }
         if (idx == 1) renderControl();
         if (idx == 2) { renderHvac(); fetchState(); }   // 진입 시 공조상태 동기화(비깨움 GET)
         if (idx == 3) {                                  // 상태: 스크롤/페이드 초기화 후 동기화
@@ -199,6 +267,7 @@ public class MainActivity extends Activity {
             renderStatus();
             fetchState();
         }
+        if (idx == 4) { renderCharge(); fetchState(); }
     }
 
     // 뒤로가기/스와이프-dismiss는 onBackPressed 하나로만 처리(이중처리 방지)
@@ -219,7 +288,7 @@ public class MainActivity extends Activity {
         mainCarBg.setAlpha(0f);
         try {
             InputStream is = getAssets().open("s1.png");
-            mainCarBg.setImageBitmap(BitmapFactory.decodeStream(is));
+            mainCarBg.setImageBitmap(retintDarkGray(BitmapFactory.decodeStream(is)));
             is.close();
         } catch (Exception e) {}
         s.addView(mainCarBg, new FrameLayout.LayoutParams(
@@ -251,20 +320,48 @@ public class MainActivity extends Activity {
         });
         mainOverlay.addView(battTap, lp(180, 12, 120, 62));
 
-        // 점선들 (차량 → 글자). 제어/상태는 아래→위, 공조는 위→아래로 자람
+        // 점선들 (차량 → 글자). 제어/상태는 아래→위, 공조/충전은 위→아래로 자람
         dashCtl  = new DashLine(this, false); mainOverlay.addView(dashCtl,  lp(78, 134, 4, 120));
         dashStat = new DashLine(this, false); mainOverlay.addView(dashStat, lp(374, 108, 4, 78));
-        dashHvac = new DashLine(this, true);  mainOverlay.addView(dashHvac, lp(280, 300, 4, 98));
+        dashHvac = new DashLine(this, true);  mainOverlay.addView(dashHvac, lp(150, 307, 4, 88));
+        dashChg  = new DashLine(this, true);  mainOverlay.addView(dashChg,  lp(352, 292, 4, 88));
 
         // 라벨 — 클릭영역 168×72 (가로 -5%, 세로 +20%), 리플은 글자 크기 알약형
         lblCtl  = label("제어", new Runnable(){ public void run(){ show(1); } });
         lblStat = label("상태", new Runnable(){ public void run(){ show(3); } });
         lblHvac = label("공조", new Runnable(){ public void run(){ show(2); } });
+        lblChg  = label("충전", new Runnable(){ public void run(){ show(4); } });
         mainOverlay.addView(lblCtl,  lp(-4, 71, 168, 72));
         mainOverlay.addView(lblStat, lp(292, 44, 168, 72));
-        mainOverlay.addView(lblHvac, lp(198, 396, 168, 72));
+        mainOverlay.addView(lblHvac, lp(66, 400, 168, 72));
+        mainOverlay.addView(lblChg,  lp(268, 384, 168, 72));
+
+        // 가운데 원형 영역(차량 중앙) 탭 → 깨우기만 전송 (시각 표시 없음)
+        View wakeTap = new View(this);
+        wakeTap.setOnClickListener(new View.OnClickListener(){
+            @Override public void onClick(View v){ wakeOnly(); }
+        });
+        mainOverlay.addView(wakeTap, lp(170, 168, 140, 140));
+
+        // 하단 중앙 상태 아이콘 (sleep/wifi) — 공조 글자(32) 대비 2px 작은 높이 = 30
+        statusIcon = new ImageView(this);
+        statusIcon.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        statusIcon.setColorFilter(C_OFF);
+        int sz = 30;
+        mainOverlay.addView(statusIcon, lp((480 - sz) / 2, 442, sz, sz));
 
         renderMain();
+    }
+
+    private void wakeOnly() {
+        if (lastAwake) return;   // 이미 깨어있으면 전송 안 함
+        toast("차량 깨우는 중…");
+        new Thread(new Runnable(){
+            @Override public void run(){
+                try { httpPost(BASE + "/api/command/wake?key=" + KEY); } catch (Exception e) {}
+                ui.postDelayed(new Runnable(){ public void run(){ fetchState(); } }, 4000);
+            }
+        }).start();
     }
 
     private TextView label(String text, final Runnable onTap) {
@@ -289,8 +386,8 @@ public class MainActivity extends Activity {
         if (mainOverlay == null || dashCtl == null) return;
         mainOverlay.setAlpha(1f);
         if (mainCarBg != null) mainCarBg.setAlpha(0f);
-        dashCtl.setProgress(0f); dashStat.setProgress(0f); dashHvac.setProgress(0f);
-        lblCtl.setAlpha(0f); lblStat.setAlpha(0f); lblHvac.setAlpha(0f);
+        dashCtl.setProgress(0f); dashStat.setProgress(0f); dashHvac.setProgress(0f); dashChg.setProgress(0f);
+        lblCtl.setAlpha(0f); lblStat.setAlpha(0f); lblHvac.setAlpha(0f); lblChg.setAlpha(0f);
         battery.setAlpha(0f); battText.setAlpha(0f);
         if (hasWindowFocus()) mainOverlay.post(introRun);   // 이미 보이는 중(뒤로가기 복귀)
         else introPending = true;                          // 첫 실행: 창 뜬 뒤에 재생
@@ -323,7 +420,7 @@ public class MainActivity extends Activity {
         va.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
             @Override public void onAnimationUpdate(ValueAnimator a) {
                 float f = ((Float) a.getAnimatedValue()).floatValue();
-                dashCtl.setProgress(f); dashStat.setProgress(f); dashHvac.setProgress(f);
+                dashCtl.setProgress(f); dashStat.setProgress(f); dashHvac.setProgress(f); dashChg.setProgress(f);
             }
         });
         va.addListener(new AnimatorListenerAdapter() {
@@ -331,6 +428,7 @@ public class MainActivity extends Activity {
                 lblCtl.animate().alpha(1f).setDuration(400).start();
                 lblStat.animate().alpha(1f).setDuration(400).start();
                 lblHvac.animate().alpha(1f).setDuration(400).start();
+                lblChg.animate().alpha(1f).setDuration(400).start();
                 battery.animate().alpha(1f).setDuration(400).start();
                 battText.animate().alpha(1f).setDuration(400).start();
             }
@@ -341,7 +439,50 @@ public class MainActivity extends Activity {
     private void renderMain() {
         if (battText == null) return;
         battText.setText(battLabel());
-        if (battery != null) battery.setLevel(lastSoc);
+        int tint = stCharging ? C_GRN : (chargeFailed() ? C_YEL : C_PCT);
+        battText.setTextColor(tint);
+        if (battery != null) { battery.setLevel(lastSoc); battery.setTintOverride(tint == C_PCT ? 0 : tint); }
+        if (statusIcon != null) statusIcon.setImageResource(lastAwake ? R.drawable.ic_wifi : R.drawable.ic_sleep);
+        if (cur == 0 && swUpdateAvail && !swBannerShown) { swBannerShown = true; showSwBanner(); }
+    }
+
+    /** 신규 소프트웨어 배너 — 메인 상단, 2초 후 사라짐 */
+    private void showSwBanner() {
+        LinearLayout banner = new LinearLayout(this);
+        banner.setOrientation(LinearLayout.HORIZONTAL);
+        banner.setGravity(Gravity.CENTER);
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(Color.parseColor("#cc2a2c2e"));   // 반투명 어두운 회색
+        bg.setCornerRadius(26 * S);
+        banner.setBackground(bg);
+        int hp = Math.round(20 * S), vp = Math.round(12 * S);
+        banner.setPadding(hp, vp, hp, vp);
+
+        TextView tv = new TextView(this);
+        tv.setText("신규 소프트웨어 ");
+        tv.setTextColor(Color.WHITE);
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, 22 * S);
+        tv.setTypeface(tv.getTypeface(), Typeface.BOLD);
+        banner.addView(tv);
+
+        ImageView ic = new ImageView(this);
+        ic.setImageResource(R.drawable.ic_download);
+        int isz = Math.round(26 * S);
+        banner.addView(ic, new LinearLayout.LayoutParams(isz, isz));
+
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        lp.topMargin = Math.round(96 * S);
+        final FrameLayout host = mainOverlay;
+        banner.setAlpha(0f);
+        host.addView(banner, lp);
+        banner.animate().alpha(1f).setDuration(200).start();
+        ui.postDelayed(new Runnable(){ @Override public void run(){
+            banner.animate().alpha(0f).setDuration(250).withEndAction(new Runnable(){
+                @Override public void run(){ host.removeView(banner); }
+            }).start();
+        }}, 2000);
     }
 
     private String battLabel() {
@@ -373,10 +514,21 @@ public class MainActivity extends Activity {
         // 아이콘 크기는 유지, 클릭영역만 15% 크게 (addIcon) + 누를 때 흰 원형 리플
         icFrunk = iconConfirm(R.drawable.ic_frunk, "프렁크를", "프렁크", "/api/trunk?which=front");
         addIcon(controlOverlay, icFrunk, 240, 62, 56);    // 맨 위 중앙
-        icDoor = iconHold(R.drawable.ic_door, new Runnable(){ public void run(){ toggleLock(); } });
+        // 잠금해제(=위험)는 길게, 잠금(=끄기)은 단일 클릭
+        icDoor = iconSmartHold(R.drawable.ic_door,
+                new BoolFn(){ public boolean get(){ return tb(stLocked); } },
+                new Runnable(){ public void run(){ toggleLock(); } });
         addIcon(controlOverlay, icDoor, 240, 240, 64);    // 정중앙
-        icCharge = iconHold(R.drawable.ic_chargeport, new Runnable(){ public void run(){ toggleCharge(); } });
-        addIcon(controlOverlay, icCharge, 92, 320, 56);   // 좌측 2/3
+        // 충전구 열기는 길게, 닫기는 단일 클릭
+        icCharge = iconSmartHold(R.drawable.ic_chargeport,
+                new BoolFn(){ public boolean get(){ return !tb(stChargeOpen); } },
+                new Runnable(){ public void run(){ toggleCharge(); } });
+        addIcon(controlOverlay, icCharge, 92, 330, 56);   // 좌측 2/3 (+10 down)
+        // 센트리 켜기는 길게, 끄기는 단일 클릭
+        icSentry = iconSmartHold(R.drawable.ic_sentry,
+                new BoolFn(){ public boolean get(){ return !tb(stSentry); } },
+                new Runnable(){ public void run(){ toggleSentry(); } });
+        addIcon(controlOverlay, icSentry, 380, 220, 52);  // 우측 (+10 right, -20 up)
         icTrunk = iconConfirm(R.drawable.ic_trunk, "트렁크를", "트렁크", "/api/trunk?which=rear");
         addIcon(controlOverlay, icTrunk, 240, 418, 56);   // 맨 아래 중앙
 
@@ -446,21 +598,73 @@ public class MainActivity extends Activity {
         return iv;
     }
 
-    /** 뷰에 물 차오름 홀드 동작 부착. showAlertOnFail=true면 짧게 뗄 때 "길게 눌러서 실행" 표시 */
-    private void attachHold(View v, final Runnable onComplete, final boolean showAlertOnFail) {
+    private interface BoolFn { boolean get(); }
+
+    /** 조건부: needsHold=true면 길게 눌러 실행(켜기), false면 단일 클릭 즉시 실행(끄기·알럿없음) */
+    private ImageView iconSmartHold(int res, final BoolFn needsHold, final Runnable action) {
+        ImageView iv = new ImageView(this);
+        iv.setImageResource(res);
+        iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        iv.setColorFilter(C_OFF);
+        iv.setBackground(circleRipple());
+        attachSmartHold(iv, needsHold, action);
+        return iv;
+    }
+
+    private void attachSmartHold(View v, final BoolFn needsHold, final Runnable action) {
         v.setOnTouchListener(new View.OnTouchListener() {
+            boolean holdMode = false;
+            final boolean[] completed = {false};
             @Override public boolean onTouch(View vv, MotionEvent e) {
                 switch (e.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
                         vv.setPressed(true);
-                        waterOv.start(onComplete);
+                        holdMode = needsHold.get();
+                        completed[0] = false;
+                        if (holdMode) waterOv.start(new Runnable() {
+                            @Override public void run() { completed[0] = true; action.run(); }
+                        });
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        vv.setPressed(false);
+                        if (holdMode) {
+                            if (!completed[0]) { waterOv.cancel(); showCenterAlert("길게 눌러서 실행"); }
+                            // 완료됐으면 물은 이미 자동 사라짐 + 알럿 없음
+                        } else {
+                            action.run();   // 끄기: 단일 클릭 즉시
+                        }
+                        return true;
+                    case MotionEvent.ACTION_CANCEL:
+                        vv.setPressed(false);
+                        if (holdMode && !completed[0]) waterOv.cancel();
+                        return true;
+                }
+                return false;
+            }
+        });
+    }
+
+    /** 뷰에 물 차오름 홀드 동작 부착. showAlertOnFail=true면 짧게 뗄 때 "길게 눌러서 실행" 표시 */
+    private void attachHold(View v, final Runnable onComplete, final boolean showAlertOnFail) {
+        v.setOnTouchListener(new View.OnTouchListener() {
+            final boolean[] completed = {false};
+            @Override public boolean onTouch(View vv, MotionEvent e) {
+                switch (e.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        vv.setPressed(true);
+                        completed[0] = false;
+                        waterOv.start(new Runnable() {
+                            @Override public void run() { completed[0] = true; onComplete.run(); }
+                        });
                         return true;
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
                         vv.setPressed(false);
-                        boolean incomplete = waterOv.progress < 0.99f;
-                        waterOv.cancel();
-                        if (incomplete && showAlertOnFail) showCenterAlert("길게 눌러서 실행");
+                        if (!completed[0]) {
+                            waterOv.cancel();
+                            if (showAlertOnFail && e.getActionMasked() == MotionEvent.ACTION_UP)
+                                showCenterAlert("길게 눌러서 실행");
+                        }
                         return true;
                 }
                 return false;
@@ -620,6 +824,7 @@ public class MainActivity extends Activity {
                 @Override public void onAnimationEnd(Animator a) {
                     if (progress >= 0.99f && onComplete != null) {
                         Runnable r = onComplete; onComplete = null; r.run();
+                        fadeOut();   // 완료 시 자동으로 물 사라짐 (busy로 ACTION_UP 못 받는 경우 대비)
                     }
                 }
             });
@@ -685,6 +890,7 @@ public class MainActivity extends Activity {
         icFrunk.setColorFilter(tb(stFrunkOpen) ? C_WHT : C_OFF);
         icTrunk.setColorFilter(tb(stTrunkOpen) ? C_WHT : C_OFF);
         icCharge.setColorFilter(tb(stChargeOpen) ? C_GRN : C_OFF);
+        if (icSentry != null) icSentry.setColorFilter(tb(stSentry) ? C_LOW : C_OFF);
     }
 
     private void toggleLock() {
@@ -695,6 +901,17 @@ public class MainActivity extends Activity {
     private void toggleCharge() {
         boolean open = tb(stChargeOpen);
         cmd("/api/command/" + (open ? "charge_port_close" : "charge_port_open"), open ? "충전구 닫기" : "충전구 열기");
+    }
+
+    private void toggleSentry() {
+        boolean on = tb(stSentry);
+        if (!on && !stSentryAvail) {   // 켜려는데 저전력 모드면 불가
+            showCenterAlert("저전력 모드입니다\n센트리를 켤 수 없습니다");
+            return;
+        }
+        stSentry = !on;
+        renderControl();
+        cmd("/api/sentry?on=" + (!on), on ? "센트리 OFF" : "센트리 ON");
     }
 
     private static boolean tb(Boolean b) { return b != null && b.booleanValue(); }
@@ -737,15 +954,15 @@ public class MainActivity extends Activity {
         tempText.setTypeface(tempText.getTypeface(), android.graphics.Typeface.BOLD);
         tempText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 30 * S);
         tempText.setText("–℃");
-        // 길게 눌러서 공조 ON/OFF 토글. 짧게 뗄 때는 안내 알럿
-        attachHold(tempText, new Runnable(){
-            @Override public void run(){ if (stClimate) climateOff(); else applyClimate(); }
-        }, true);
+        // 켜기는 길게(공조 OFF), 끄기는 단일 클릭(공조 ON)
+        attachSmartHold(tempText,
+                new BoolFn(){ public boolean get(){ return !stClimate; } },
+                new Runnable(){ public void run(){ if (stClimate) climateOff(); else applyClimate(); } });
         hvacOverlay.addView(tempText, lp(180, 393, 120, 44));
 
-        // 힌트: 공조 ON일 때만 "길게 눌러서 공조 끄기"
+        // 힌트: 공조 OFF일 때만 "길게 눌러서 켜기"
         hintText = new TextView(this);
-        hintText.setText("길게 눌러서 공조 끄기");
+        hintText.setText("길게 눌러서 켜기");
         hintText.setTextColor(C_ARROW);
         hintText.setGravity(Gravity.CENTER);
         hintText.setTextSize(TypedValue.COMPLEX_UNIT_PX, 12 * S);
@@ -820,6 +1037,7 @@ public class MainActivity extends Activity {
 
     private void applyClimate() {
         if (tempSet < 0) return;
+        if (!beginCmd()) return;
         final int t = tempSet;
         new Thread(new Runnable() {
             @Override public void run() {
@@ -832,6 +1050,7 @@ public class MainActivity extends Activity {
                     final boolean fok = ok;
                     ui.post(new Runnable(){ public void run(){ toast(fok ? (t + "℃ 공조 ON") : "공조 실패"); if (fok) { stClimate = true; renderHvac(); } } });
                 } finally {
+                    endCmd();
                     ui.postDelayed(new Runnable(){ public void run(){ fetchState(); } }, 2500);
                 }
             }
@@ -839,6 +1058,7 @@ public class MainActivity extends Activity {
     }
 
     private void climateOff() {
+        if (!beginCmd()) return;
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
@@ -849,6 +1069,7 @@ public class MainActivity extends Activity {
                     final boolean fok = ok;
                     ui.post(new Runnable(){ public void run(){ toast(fok ? "공조 OFF" : "공조 끄기 실패"); if (fok) { stClimate = false; renderHvac(); } } });
                 } finally {
+                    endCmd();
                     ui.postDelayed(new Runnable(){ public void run(){ fetchState(); } }, 2500);
                 }
             }
@@ -861,7 +1082,7 @@ public class MainActivity extends Activity {
         paintWheel();
         tempText.setText((tempSet >= 0 ? tempSet : "–") + "℃");
         if (hvacOn != null) hvacOn.animate().alpha(stClimate ? 1f : 0f).setDuration(400).start();
-        if (hintText != null) hintText.setVisibility(stClimate ? View.VISIBLE : View.GONE);
+        if (hintText != null) hintText.setVisibility(stClimate ? View.GONE : View.VISIBLE);
     }
 
     private void paintSeat(int idx) {
@@ -878,7 +1099,7 @@ public class MainActivity extends Activity {
     // ═══════════ 화면4: 상태 (스크롤) ═══════════
     private void buildStatus() {
         final FrameLayout s = screen[3];
-        s.setBackgroundColor(Color.parseColor("#161719"));
+        s.setBackgroundColor(BG);
 
         // 차 이미지 배경 (스크롤 시 페이드아웃)
         statBg = new ImageView(this);
@@ -929,6 +1150,195 @@ public class MainActivity extends Activity {
         });
 
         renderStatus();
+    }
+
+    // ═══════════ 화면5: 충전 ═══════════
+    private void buildCharge() {
+        FrameLayout s = screen[4];
+        // 맨 아래: bg.png (즉시), 그 위 s5.png (첫 애니 페이드)
+        addBg(s, "bg.png");
+        chgCarBg = new ImageView(this);
+        chgCarBg.setScaleType(ImageView.ScaleType.FIT_XY);
+        chgCarBg.setAlpha(0f);
+        Bitmap bm = loadAsset("s5.png");
+        if (bm != null) chgCarBg.setImageBitmap(bm);
+        s.addView(chgCarBg, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // 충전구 → 번개까지 가로 점선 (우→좌)
+        dashOpen = new DashLine(this, DashLine.H_RL);
+        s.addView(dashOpen, lp(112, 150, 145, 30));
+
+        // 번개(충전 잠금해제) 아이콘
+        icOpen = new ImageView(this);
+        icOpen.setImageResource(R.drawable.ic_open);
+        icOpen.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        icOpen.setColorFilter(C_WHT);
+        icOpen.setAlpha(0f);
+        icOpen.setBackground(circleRipple());
+        icOpen.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { toggleCharge(); }
+        });
+        s.addView(icOpen, lp(58, 143, 56, 56));
+
+        // 충전 정보 오버레이 (애니 마지막 단계에서 페이드)
+        chgOverlay = new FrameLayout(this);
+        chgOverlay.setAlpha(0f);
+        s.addView(chgOverlay, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+
+        // SOC %
+        chgSoc = new TextView(this);
+        chgSoc.setTextColor(Color.WHITE);
+        chgSoc.setGravity(Gravity.LEFT | Gravity.BOTTOM);
+        chgSoc.setTypeface(chgSoc.getTypeface(), android.graphics.Typeface.BOLD);
+        chgSoc.setTextSize(TypedValue.COMPLEX_UNIT_PX, 42 * S);
+        chgSoc.setText("–%");
+        chgOverlay.addView(chgSoc, lp(50, 258, 150, 54));
+
+        // 주행가능 거리 (글자 20% 크게: 19→23)
+        chgRange = new TextView(this);
+        chgRange.setTextColor(Color.parseColor("#c8cacb"));
+        chgRange.setGravity(Gravity.LEFT | Gravity.BOTTOM);
+        chgRange.setTextSize(TypedValue.COMPLEX_UNIT_PX, 23 * S);
+        chgRange.setText("– km 주행가능");
+        // 하단정렬 맞춤: chgSoc 하단(258+54=312)과 동일하게 chgRange bottom = 312
+        chgOverlay.addView(chgRange, lp(178, 278, 300, 34));
+
+        // 게이지 + 드래그 흰 원 (너비 10%↓: 424→382, 중앙 유지 x=49, y -20)
+        chargeBar = new ChargeBar(this);
+        chargeBar.setListeners(new Runnable() {
+            @Override public void run() { chgLimitSel = chargeBar.getLimit(); updateLimitLabel(); }
+        }, new Runnable() {
+            @Override public void run() { setChargeLimit(chargeBar.getLimit()); }
+        });
+        chgOverlay.addView(chargeBar, lp(49, 316, 382, 44));
+
+        // 흰 원 아래 제한 % 텍스트 (크기 18→24)
+        chgLimitTxt = new TextView(this);
+        chgLimitTxt.setTextColor(Color.WHITE);
+        chgLimitTxt.setGravity(Gravity.CENTER);
+        chgLimitTxt.setTextSize(TypedValue.COMPLEX_UNIT_PX, 24 * S);
+        chgLimitTxt.setText("80%");
+        chgOverlay.addView(chgLimitTxt, lp(0, 354, 80, 30));
+
+        // 완충 예상 시각 (하단 중앙) — 크기 21→23 (10%), y 424→414
+        chgEta = new TextView(this);
+        chgEta.setTextColor(Color.WHITE);
+        chgEta.setGravity(Gravity.CENTER);
+        chgEta.setTextSize(TypedValue.COMPLEX_UNIT_PX, 23 * S);
+        chgEta.setText("");
+        chgOverlay.addView(chgEta, lp(20, 414, 440, 32));
+
+        renderCharge();
+    }
+
+    private final Runnable chargeIntroRun = new Runnable() { @Override public void run() { playChargeIntro(); } };
+
+    private void startChargeIntro() {
+        if (chgCarBg == null) return;
+        chgCarBg.setAlpha(0f);
+        dashOpen.setProgress(0f);
+        icOpen.setAlpha(0f);
+        chgOverlay.setAlpha(0f);
+        screen[4].post(chargeIntroRun);
+    }
+
+    private void playChargeIntro() {
+        // 1) s5 페이드 → 2) 점선 성장 → 3) 번개 페이드 → 4) 충전정보 페이드
+        chgCarBg.animate().alpha(1f).setDuration(300).withEndAction(new Runnable() {
+            @Override public void run() {
+                ValueAnimator va = ValueAnimator.ofFloat(0f, 1f);
+                va.setDuration(650);
+                va.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                    @Override public void onAnimationUpdate(ValueAnimator a) {
+                        dashOpen.setProgress(((Float) a.getAnimatedValue()).floatValue());
+                    }
+                });
+                va.addListener(new AnimatorListenerAdapter() {
+                    @Override public void onAnimationEnd(Animator a) {
+                        icOpen.animate().alpha(1f).setDuration(400).start();
+                        chgOverlay.animate().alpha(1f).setStartDelay(200).setDuration(400)
+                                .withEndAction(new Runnable(){ @Override public void run(){ updateLimitLabel(); } })
+                                .start();
+                    }
+                });
+                va.start();
+            }
+        }).start();
+    }
+
+    private void updateLimitLabel() {
+        if (chgLimitTxt == null || chargeBar == null) return;
+        chgLimitTxt.setText(chargeBar.getLimit() + "%");
+        float x = chargeBar.getX() + chargeBar.knobCenterX() - Math.round(40 * S);
+        if (chargeBar.getWidth() > 0) chgLimitTxt.setX(x);
+    }
+
+    private void renderCharge() {
+        renderChargeText();
+        renderChargeBar();
+    }
+
+    /** 슬라이더 포함 전체 갱신 (화면 진입 시) */
+    private void renderChargeBar() {
+        if (chargeBar == null) return;
+        chargeBar.setSoc(lastSoc >= 0 ? lastSoc : 0);
+        if (chgLimitSel < 50) chgLimitSel = lastLimit;
+        chargeBar.setLimit(lastLimit);
+        chgLimitSel = lastLimit;
+        chargeBar.post(new Runnable(){ @Override public void run(){ updateLimitLabel(); } });
+    }
+
+    /** 텍스트만 갱신 (충전화면 표시 중에도 안전 — 슬라이더 드래그 위치 유지) */
+    private void renderChargeText() {
+        if (chgSoc == null) return;
+        if (icOpen != null) icOpen.setColorFilter(tb(stChargeOpen) ? C_GRN : C_WHT);
+        chgSoc.setText((lastSoc >= 0 ? lastSoc : "–") + "%");
+        chgRange.setText((lastRangeKm >= 0 ? lastRangeKm : "–") + " km 주행가능");
+        if (chargeBar != null) chargeBar.setSoc(lastSoc >= 0 ? lastSoc : 0);
+        if (stCharging) {
+            chgEta.setText(chargeEtaText(lastMinToFull));
+            chgEta.setTextSize(TypedValue.COMPLEX_UNIT_PX, 23 * S);
+            chgEta.setTextColor(Color.WHITE);
+        } else if (chargeDone()) {
+            chgEta.setText("충전 완료");
+            chgEta.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28 * S);
+            chgEta.setTextColor(Color.WHITE);
+        } else if (chargeFailed()) {
+            chgEta.setText("충전 불가");
+            chgEta.setTextSize(TypedValue.COMPLEX_UNIT_PX, 28 * S);
+            chgEta.setTextColor(C_YEL);
+        } else {
+            chgEta.setText("");
+            chgEta.setTextColor(Color.WHITE);
+        }
+        chargeBar.post(new Runnable(){ @Override public void run(){ updateLimitLabel(); } });
+    }
+
+    private void setChargeLimit(final int pct) {
+        lastLimit = pct;
+        chgAttemptTs = System.currentTimeMillis();
+        cmd("/api/charge_limit?percent=" + pct, "충전 한도 " + pct + "%");
+    }
+
+    private String chargeEtaText(int minutes) {
+        if (minutes <= 0) return "";
+        java.util.Calendar now = java.util.Calendar.getInstance();
+        java.util.Calendar fin = (java.util.Calendar) now.clone();
+        fin.add(java.util.Calendar.MINUTE, minutes);
+        java.util.Calendar d0 = (java.util.Calendar) now.clone();
+        java.util.Calendar d1 = (java.util.Calendar) fin.clone();
+        for (java.util.Calendar c : new java.util.Calendar[]{d0, d1}) {
+            c.set(java.util.Calendar.HOUR_OF_DAY, 0); c.set(java.util.Calendar.MINUTE, 0);
+            c.set(java.util.Calendar.SECOND, 0); c.set(java.util.Calendar.MILLISECOND, 0);
+        }
+        long days = Math.round((d1.getTimeInMillis() - d0.getTimeInMillis()) / 86400000.0);
+        String day = days <= 0 ? "오늘" : days == 1 ? "다음날" : days == 2 ? "모레"
+                : (fin.get(java.util.Calendar.MONTH) + 1) + "/" + fin.get(java.util.Calendar.DAY_OF_MONTH);
+        String hh = String.format("%02d", fin.get(java.util.Calendar.HOUR_OF_DAY));
+        String mm = String.format("%02d", fin.get(java.util.Calendar.MINUTE));
+        return day + " " + hh + ":" + mm + "에 충전 완료";
     }
 
     private void renderStatus() {
@@ -1000,11 +1410,35 @@ public class MainActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
     }
 
+    /** 이미지의 어두운 회색 배경(#101010~#181820 범위)을 #161719로 치환 */
+    private Bitmap retintDarkGray(Bitmap src) {
+        if (src == null) return null;
+        try {
+            Bitmap out = src.copy(Bitmap.Config.ARGB_8888, true);
+            int w = out.getWidth(), h = out.getHeight();
+            int[] px = new int[w * h];
+            out.getPixels(px, 0, w, 0, 0, w, h);
+            final int TR = 0x16, TG = 0x17, TB = 0x19;
+            for (int i = 0; i < px.length; i++) {
+                int c = px[i];
+                int a = (c >>> 24) & 0xff;
+                int r = (c >> 16) & 0xff, g = (c >> 8) & 0xff, b = c & 0xff;
+                // 어두운 무채색(R/G/B ≤ 30, 서로 차이 8 이내)만 치환 — 그림자 등 보호
+                if (a > 0 && r <= 30 && g <= 30 && b <= 30
+                        && Math.abs(r - g) < 8 && Math.abs(g - b) < 8 && Math.abs(r - b) < 8) {
+                    px[i] = (a << 24) | (TR << 16) | (TG << 8) | TB;
+                }
+            }
+            out.setPixels(px, 0, w, 0, 0, w, h);
+            return out;
+        } catch (Exception e) { return src; }
+    }
+
     private Bitmap loadAsset(String name) {
         InputStream is = null;
         try {
             is = getAssets().open(name);
-            return BitmapFactory.decodeStream(is);
+            return retintDarkGray(BitmapFactory.decodeStream(is));
         } catch (Exception e) {
             return null;
         } finally {
@@ -1016,21 +1450,31 @@ public class MainActivity extends Activity {
     private final Runnable refreshLoop = new Runnable() {
         @Override public void run() { fetchState(); ui.postDelayed(this, 60000); }
     };
+    /** 서브화면(제어/공조/상태/충전) 표시 중 5초마다 상태 새로 가져오기 */
+    private final Runnable fastLoop = new Runnable() {
+        @Override public void run() {
+            fetchState();
+            if (cur != 0) ui.postDelayed(this, 5000);
+        }
+    };
 
     private void fetchState() {
         new Thread(new Runnable() {
             @Override public void run() {
                 JSONObject resp = null;
+                boolean cached = true;
                 try {
                     String body = httpGet(BASE + "/api/state?key=" + KEY);
                     JSONObject j = new JSONObject(body);
                     resp = j.optJSONObject("response");
+                    cached = j.optBoolean("cached", true);
                 } catch (Exception e) {
                     // 무시
                 }
                 final JSONObject fresp = resp;
+                final boolean fawake = (resp != null && !cached);
                 ui.post(new Runnable() {
-                    @Override public void run() { applyState(fresp); }
+                    @Override public void run() { lastAwake = fawake; applyState(fresp); renderMain(); }
                 });
             }
         }).start();
@@ -1046,11 +1490,23 @@ public class MainActivity extends Activity {
             if (cs.has("battery_level")) lastSoc = cs.optInt("battery_level", lastSoc);
             if (cs.has("battery_range")) lastRangeKm = (int) Math.round(cs.optDouble("battery_range", 0) * MI);
             if (cs.has("charge_port_door_open")) stChargeOpen = cs.optBoolean("charge_port_door_open");
+            if (cs.has("charge_limit_soc") && cur != 4) lastLimit = cs.optInt("charge_limit_soc", lastLimit);
+            if (cs.has("minutes_to_full_charge")) lastMinToFull = cs.optInt("minutes_to_full_charge", -1);
+            if (cs.has("charging_state")) {
+                chargingState = cs.optString("charging_state", "");
+                stCharging = "Charging".equals(chargingState);
+                stChargeComplete = "Complete".equals(chargingState);
+            }
         }
         if (vs != null) {
             if (vs.has("locked")) stLocked = vs.optBoolean("locked");
             if (vs.has("ft")) stFrunkOpen = vs.optInt("ft", 0) != 0;
             if (vs.has("rt")) stTrunkOpen = vs.optInt("rt", 0) != 0;
+            if (vs.has("sentry_mode")) stSentry = vs.optBoolean("sentry_mode");
+            if (vs.has("sentry_mode_available")) stSentryAvail = vs.optBoolean("sentry_mode_available", true);
+            JSONObject su = vs.optJSONObject("software_update");
+            String sust = su != null ? su.optString("status", "") : "";
+            swUpdateAvail = sust != null && !sust.isEmpty() && !"unavailable".equals(sust);
         }
         if (cl != null) {
             seatLevel[0] = cl.optInt("seat_heater_left", seatLevel[0]);
@@ -1068,9 +1524,43 @@ public class MainActivity extends Activity {
         renderControl();
         renderHvac();
         renderStatus();
+        if (cur != 4) renderCharge();
+        else renderChargeText();          // 충전화면 표시 중엔 텍스트만 (슬라이더 위치 유지)
+        if (cmdBusy) applyBusyTint();     // 전송중이면 회색 유지
+    }
+
+    // ── 명령 전송중 잠금 ──
+    private boolean beginCmd() {
+        if (cmdBusy) return false;
+        cmdBusy = true;
+        ui.post(new Runnable(){ public void run(){ setCommandsBusy(true); } });
+        return true;
+    }
+    private void endCmd() {
+        cmdBusy = false;
+        ui.post(new Runnable(){ public void run(){ setCommandsBusy(false); } });
+    }
+    private void setCommandsBusy(boolean busy) {
+        View[] all = { icDoor, icFrunk, icTrunk, icCharge, icSentry, icWheel, icArrowUp, icArrowDown,
+                       icOpen, seatIcon[0], seatIcon[1], seatIcon[2], seatIcon[3], seatIcon[4],
+                       tempText, chargeBar };
+        for (View v : all) if (v != null) v.setEnabled(!busy);
+        if (busy) {
+            applyBusyTint();
+        } else {
+            renderControl(); renderHvac();
+            if (cur == 4) renderChargeText(); else renderCharge();
+        }
+    }
+    private void applyBusyTint() {
+        ImageView[] tint = { icDoor, icFrunk, icTrunk, icCharge, icSentry, icWheel, icArrowUp, icArrowDown,
+                             icOpen, seatIcon[0], seatIcon[1], seatIcon[2], seatIcon[3], seatIcon[4] };
+        for (ImageView iv : tint) if (iv != null) iv.setColorFilter(C_BUSY);
+        if (tempText != null) tempText.setTextColor(C_BUSY);
     }
 
     private void cmd(final String path, final String label) {
+        if (!beginCmd()) return;   // 이미 전송중이면 무시
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
@@ -1082,6 +1572,7 @@ public class MainActivity extends Activity {
                     final boolean fok = ok;
                     ui.post(new Runnable(){ public void run(){ toast(label + (fok ? " 완료" : " 실패")); } });
                 } finally {
+                    endCmd();
                     ui.postDelayed(new Runnable(){ public void run(){ fetchState(); } }, 2000);
                     ui.postDelayed(new Runnable(){ public void run(){ fetchState(); } }, 5000);
                 }
@@ -1153,6 +1644,7 @@ public class MainActivity extends Activity {
     /** 가로 배터리 아이콘 (48×24 뷰박스 기준, 레벨 비례 채움) */
     private class BatteryView extends View {
         private int level = -1;
+        private int tintOverride = 0;   // 0=기본색, 그 외=강제 색상
         private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint fill   = new Paint(Paint.ANTI_ALIAS_FLAG);
 
@@ -1164,15 +1656,19 @@ public class MainActivity extends Activity {
         }
 
         void setLevel(int l) { level = l; invalidate(); }
+        void setTintOverride(int c) {
+            if (tintOverride != c) { tintOverride = c; invalidate(); }
+        }
 
         @Override protected void onDraw(Canvas cv) {
             float sx = getWidth() / 48f, sy = getHeight() / 24f;
             stroke.setStrokeWidth(2 * sx);
+            stroke.setColor(tintOverride != 0 ? tintOverride : C_OUT);
             cv.drawRoundRect(1 * sx, 4 * sy, 41 * sx, 20 * sy, 3 * sx, 3 * sx, stroke);
-            fill.setColor(C_OUT);
+            fill.setColor(tintOverride != 0 ? tintOverride : C_OUT);
             cv.drawRoundRect(43 * sx, 9 * sy, 46.5f * sx, 15 * sy, 1 * sx, 1 * sx, fill);
             if (level >= 0) {
-                fill.setColor(level <= 15 ? C_LOW : C_FILL);
+                fill.setColor(tintOverride != 0 ? tintOverride : (level <= 15 ? C_LOW : C_FILL));
                 float w = 34f * Math.max(0, Math.min(100, level)) / 100f;
                 if (w > 0) cv.drawRoundRect(4 * sx, 7 * sy, (4 + w) * sx, 17 * sy, 1.5f * sx, 1.5f * sx, fill);
             }
@@ -1181,12 +1677,14 @@ public class MainActivity extends Activity {
 
     /** 수직 점선 (progress로 자라나는 애니메이션) */
     private class DashLine extends View {
+        static final int V_DOWN = 0, V_UP = 1, H_RL = 2;   // 세로↓ / 세로↑ / 가로 우→좌
         private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final boolean downward;   // true: 위→아래, false: 아래→위
+        private final int mode;
         private float prog = 1f;
-        DashLine(Context ctx, boolean downward) {
+        DashLine(Context ctx, boolean downward) { this(ctx, downward ? V_DOWN : V_UP); }
+        DashLine(Context ctx, int mode) {
             super(ctx);
-            this.downward = downward;
+            this.mode = mode;
             p.setStyle(Paint.Style.STROKE);
             p.setColor(C_DASH);
             p.setStrokeWidth(2 * S);
@@ -1195,9 +1693,60 @@ public class MainActivity extends Activity {
         void setProgress(float f) { prog = f; invalidate(); }
         @Override protected void onDraw(Canvas cv) {
             if (prog <= 0f) return;
-            float x = getWidth() / 2f, h = getHeight();
-            if (downward) cv.drawLine(x, 0, x, h * prog, p);
-            else          cv.drawLine(x, h, x, h - h * prog, p);
+            float x = getWidth() / 2f, h = getHeight(), w = getWidth(), y = getHeight() / 2f;
+            if (mode == V_DOWN)      cv.drawLine(x, 0, x, h * prog, p);
+            else if (mode == V_UP)   cv.drawLine(x, h, x, h - h * prog, p);
+            else                     cv.drawLine(w, y, w - w * prog, y, p);   // H_RL
         }
+    }
+
+    // ═══════════ 충전 게이지 (초록 잔량 + 드래그 노란 제한원) ═══════════
+    private class ChargeBar extends View {
+        private final Paint pTrack = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint pFill  = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint pKnob  = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private int soc = 0, limit = 80;
+        private Runnable onLimitChange, onLimitCommit;
+        ChargeBar(Context ctx) {
+            super(ctx);
+            pTrack.setColor(Color.parseColor("#3a3d40"));
+            pFill.setColor(C_GRN);
+            pKnob.setColor(Color.WHITE);
+        }
+        void setSoc(int s) { soc = s; invalidate(); }
+        void setLimit(int l) { limit = Math.max(50, Math.min(100, l)); invalidate(); }
+        int getLimit() { return limit; }
+        void setListeners(Runnable change, Runnable commit) { onLimitChange = change; onLimitCommit = commit; }
+
+        private float padL() { return 26 * S; }
+        private float padR() { return 26 * S; }
+        private float trackW() { return getWidth() - padL() - padR(); }
+        private float barY() { return 20 * S; }
+        private float xForPct(int pct) { return padL() + trackW() * pct / 100f; }
+
+        @Override protected void onDraw(Canvas cv) {
+            float y = barY(), r = 5 * S;
+            cv.drawRoundRect(padL(), y - r, padL() + trackW(), y + r, r, r, pTrack);
+            cv.drawRoundRect(padL(), y - r, xForPct(soc), y + r, r, r, pFill);
+            cv.drawCircle(xForPct(limit), y, 13 * S, pKnob);
+        }
+        @Override public boolean onTouchEvent(MotionEvent e) {
+            switch (e.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_MOVE: {
+                    getParent().requestDisallowInterceptTouchEvent(true);
+                    float pct = (e.getX() - padL()) / trackW() * 100f;
+                    int nl = Math.max(50, Math.min(100, Math.round(pct)));
+                    if (nl != limit) { limit = nl; invalidate(); if (onLimitChange != null) onLimitChange.run(); }
+                    return true;
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL:
+                    if (onLimitCommit != null) onLimitCommit.run();
+                    return true;
+            }
+            return super.onTouchEvent(e);
+        }
+        float knobCenterX() { return xForPct(limit); }
     }
 }

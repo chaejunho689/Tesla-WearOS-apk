@@ -1,10 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.hongcha.teslawatch"
-    android:versionCode="11"
-    android:versionName="2.0">
-
-    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="34"/>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-feature android:name="android.hardware.type.watch"/>
 
@@ -35,6 +30,27 @@
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+            <!-- 타일/딥링크: teslawatch://screen/N (0=메인,1=제어,2=공조,3=상태,4=충전) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="teslawatch" android:host="screen"/>
+            </intent-filter>
         </activity>
+
+        <!-- 메인 화면 타일(위젯): 공조/상태/제어/충전 클릭 → 앱 해당 화면 -->
+        <service
+            android:name=".MainTileService"
+            android:label="테슬라"
+            android:exported="true"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER"/>
+            </intent-filter>
+            <meta-data
+                android:name="androidx.wear.tiles.PREVIEW"
+                android:resource="@drawable/tile_preview"/>
+        </service>
     </application>
 </manifest>

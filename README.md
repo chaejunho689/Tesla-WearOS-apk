@@ -101,19 +101,25 @@ Galaxy Watch 6
 
 ---
 
-## 빌드 방법
+## 빌드 방법 (Gradle)
 
 ```bash
 # secrets.xml 생성 (실제 값 입력)
-cp secrets.xml.example res/values/secrets.xml
+cp secrets.xml.example app/src/main/res/values/secrets.xml
 # 편집기로 bridge_base, bridge_key 값 입력
 
 # 키스토어 생성 (최초 1회)
 keytool -genkey -v -keystore tesla-watch.keystore -alias teslawatch -keyalg RSA -keysize 2048 -validity 10000
 
-# 빌드
+# 빌드 (Gradle wrapper — 첫 실행 시 Gradle 8.7 자동 다운로드)
+./gradlew :app:assembleRelease
+# 또는 브릿지로 복사까지:
 bash build.sh
 ```
+
+- **표준 Gradle 프로젝트** (AGP 8.5.2, compileSdk 34, JDK 17+)
+- 앱 모듈: `app/`, 소스: `app/src/main/java`
+- Wear OS **타일(위젯)**: `MainTileService` — 배경 + 공조/상태/제어/충전 클릭 시 앱 해당 화면으로 딥링크(`teslawatch://screen/N`)
 
 ---
 

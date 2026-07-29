@@ -1,12 +1,15 @@
-# 빌드 산출물
+# Gradle / 빌드 산출물
 build/
 gen/
+.gradle/
+local.properties
 
 # 키스토어 (개인키)
 *.keystore
 *.jks
 
 # 실제 시크릿 값 (예시 파일만 커밋)
+app/src/main/res/values/secrets.xml
 res/values/secrets.xml
 
 # APK
