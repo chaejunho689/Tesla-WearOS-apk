@@ -10,8 +10,8 @@ android {
         applicationId = "com.hongcha.teslawatch"
         minSdk = 30
         targetSdk = 34
-        versionCode = 15
-        versionName = "2.4"
+        versionCode = 18
+        versionName = "2.7"
     }
 
     signingConfigs {

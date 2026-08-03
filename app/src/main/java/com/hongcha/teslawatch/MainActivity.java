@@ -94,6 +94,7 @@ public class MainActivity extends Activity {
     private TextView chgSoc, chgRange, chgLimitTxt, chgEta;
     private ChargeBar chargeBar;                          // 게이지 + 드래그 노란원
     private int chgLimitSel = 80;                         // 선택 충전 제한(50~100)
+    private boolean chgDragging = false;                  // 노란원 드래그 중(차량값 덮어쓰기 방지)
 
     // 화면4(상태)
     private ImageView statBg;
@@ -515,7 +516,7 @@ public class MainActivity extends Activity {
         icFrunk = iconConfirm(R.drawable.ic_frunk, "프렁크를", "프렁크", "/api/trunk?which=front");
         addIcon(controlOverlay, icFrunk, 240, 62, 56);    // 맨 위 중앙
         // 잠금해제(=위험)는 길게, 잠금(=끄기)은 단일 클릭
-        icDoor = iconSmartHold(R.drawable.ic_door,
+        icDoor = iconSmartHold(R.drawable.ic_lock,
                 new BoolFn(){ public boolean get(){ return tb(stLocked); } },
                 new Runnable(){ public void run(){ toggleLock(); } });
         addIcon(controlOverlay, icDoor, 240, 240, 64);    // 정중앙
@@ -885,8 +886,10 @@ public class MainActivity extends Activity {
 
     private void renderControl() {
         if (icDoor == null) return;
-        // 잠김/미확인 → 회색, 잠금해제 → 노랑
-        icDoor.setColorFilter((stLocked != null && !stLocked) ? C_YEL : C_OFF);
+        // 잠김 → 자물쇠 아이콘(회색), 잠금해제 → 열린 자물쇠 아이콘(노랑)
+        boolean unlocked = (stLocked != null && !stLocked);
+        icDoor.setImageResource(unlocked ? R.drawable.ic_unlock : R.drawable.ic_lock);
+        icDoor.setColorFilter(unlocked ? C_YEL : C_OFF);
         icFrunk.setColorFilter(tb(stFrunkOpen) ? C_WHT : C_OFF);
         icTrunk.setColorFilter(tb(stTrunkOpen) ? C_WHT : C_OFF);
         icCharge.setColorFilter(tb(stChargeOpen) ? C_GRN : C_OFF);
@@ -1208,9 +1211,9 @@ public class MainActivity extends Activity {
         // 게이지 + 드래그 흰 원 (너비 10%↓: 424→382, 중앙 유지 x=49, y -20)
         chargeBar = new ChargeBar(this);
         chargeBar.setListeners(new Runnable() {
-            @Override public void run() { chgLimitSel = chargeBar.getLimit(); updateLimitLabel(); }
+            @Override public void run() { chgDragging = true; chgLimitSel = chargeBar.getLimit(); updateLimitLabel(); }
         }, new Runnable() {
-            @Override public void run() { setChargeLimit(chargeBar.getLimit()); }
+            @Override public void run() { chgDragging = false; setChargeLimit(chargeBar.getLimit()); }
         });
         chgOverlay.addView(chargeBar, lp(49, 316, 382, 44));
 
@@ -1296,7 +1299,17 @@ public class MainActivity extends Activity {
         if (icOpen != null) icOpen.setColorFilter(tb(stChargeOpen) ? C_GRN : C_WHT);
         chgSoc.setText((lastSoc >= 0 ? lastSoc : "–") + "%");
         chgRange.setText((lastRangeKm >= 0 ? lastRangeKm : "–") + " km 주행가능");
-        if (chargeBar != null) chargeBar.setSoc(lastSoc >= 0 ? lastSoc : 0);
+        boolean connected = chargerConnected();
+        if (chargeBar != null) {
+            chargeBar.setSoc(lastSoc >= 0 ? lastSoc : 0);
+            chargeBar.setShowKnob(connected);      // 충전기 연결 시에만 제한선(노란원)
+            chargeBar.setCharging(stCharging);      // 충전 중 게이지 애니메이션
+            if (!chgDragging) { chargeBar.setLimit(lastLimit); chgLimitSel = lastLimit; }  // 차량 실제값 반영
+        }
+        if (chgLimitTxt != null) {
+            chgLimitTxt.setVisibility(connected ? View.VISIBLE : View.GONE);
+            updateLimitLabel();
+        }
         if (stCharging) {
             chgEta.setText(chargeEtaText(lastMinToFull));
             chgEta.setTextSize(TypedValue.COMPLEX_UNIT_PX, 23 * S);
@@ -1490,7 +1503,7 @@ public class MainActivity extends Activity {
             if (cs.has("battery_level")) lastSoc = cs.optInt("battery_level", lastSoc);
             if (cs.has("battery_range")) lastRangeKm = (int) Math.round(cs.optDouble("battery_range", 0) * MI);
             if (cs.has("charge_port_door_open")) stChargeOpen = cs.optBoolean("charge_port_door_open");
-            if (cs.has("charge_limit_soc") && cur != 4) lastLimit = cs.optInt("charge_limit_soc", lastLimit);
+            if (cs.has("charge_limit_soc") && !chgDragging) lastLimit = cs.optInt("charge_limit_soc", lastLimit);
             if (cs.has("minutes_to_full_charge")) lastMinToFull = cs.optInt("minutes_to_full_charge", -1);
             if (cs.has("charging_state")) {
                 chargingState = cs.optString("charging_state", "");
@@ -1705,32 +1718,69 @@ public class MainActivity extends Activity {
         private final Paint pTrack = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint pFill  = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint pKnob  = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint pSpark = new Paint(Paint.ANTI_ALIAS_FLAG);
         private int soc = 0, limit = 80;
+        private boolean showKnob = false;     // 충전기 연결 시에만 노란원 표시·조작
+        private boolean charging = false;
+        private float sparkT = 0f;            // 0=우(100%) 1=좌(soc경계)
+        private ValueAnimator sparkAnim;
         private Runnable onLimitChange, onLimitCommit;
         ChargeBar(Context ctx) {
             super(ctx);
             pTrack.setColor(Color.parseColor("#3a3d40"));
             pFill.setColor(C_GRN);
             pKnob.setColor(Color.WHITE);
+            pSpark.setColor(C_GRN);
+            pSpark.setStrokeCap(Paint.Cap.ROUND);
         }
         void setSoc(int s) { soc = s; invalidate(); }
         void setLimit(int l) { limit = Math.max(50, Math.min(100, l)); invalidate(); }
         int getLimit() { return limit; }
+        void setShowKnob(boolean b) { if (showKnob != b) { showKnob = b; invalidate(); } }
+        void setCharging(boolean c) {
+            if (charging == c) return;
+            charging = c;
+            if (c) startSpark(); else stopSpark();
+            invalidate();
+        }
+        private void startSpark() {
+            if (sparkAnim != null) return;
+            // 0~1 이동, 1~1.6 구간은 정지(패스 사이 간격) → 선은 draw에서 sparkT<=1일 때만
+            sparkAnim = ValueAnimator.ofFloat(0f, 1.6f);
+            sparkAnim.setDuration(2200);
+            sparkAnim.setRepeatCount(ValueAnimator.INFINITE);
+            sparkAnim.setInterpolator(new android.view.animation.AccelerateInterpolator(1.3f));
+            sparkAnim.addUpdateListener(new ValueAnimator.AnimatorUpdateListener() {
+                @Override public void onAnimationUpdate(ValueAnimator a) { sparkT = (Float) a.getAnimatedValue(); invalidate(); }
+            });
+            sparkAnim.start();
+        }
+        private void stopSpark() {
+            if (sparkAnim != null) { sparkAnim.cancel(); sparkAnim = null; }
+        }
         void setListeners(Runnable change, Runnable commit) { onLimitChange = change; onLimitCommit = commit; }
 
         private float padL() { return 26 * S; }
         private float padR() { return 26 * S; }
         private float trackW() { return getWidth() - padL() - padR(); }
         private float barY() { return 20 * S; }
-        private float xForPct(int pct) { return padL() + trackW() * pct / 100f; }
+        private float xForPct(float pct) { return padL() + trackW() * pct / 100f; }
 
         @Override protected void onDraw(Canvas cv) {
             float y = barY(), r = 5 * S;
             cv.drawRoundRect(padL(), y - r, padL() + trackW(), y + r, r, r, pTrack);
             cv.drawRoundRect(padL(), y - r, xForPct(soc), y + r, r, r, pFill);
-            cv.drawCircle(xForPct(limit), y, 13 * S, pKnob);
+            // 충전 중: 회색(빈) 구간에서 초록 세로선이 100%→soc경계로 우→좌 이동 (sparkT>1은 정지 간격)
+            if (charging && soc < 100 && sparkT <= 1f) {
+                float xRight = xForPct(100), xLeft = xForPct(soc);
+                float x = xRight + (xLeft - xRight) * sparkT;
+                pSpark.setStrokeWidth(3 * S);
+                cv.drawLine(x, y - r, x, y + r, pSpark);
+            }
+            if (showKnob) cv.drawCircle(xForPct(limit), y, 13 * S, pKnob);
         }
         @Override public boolean onTouchEvent(MotionEvent e) {
+            if (!showKnob) return false;   // 충전기 미연결 시 제한 조작 불가
             switch (e.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                 case MotionEvent.ACTION_MOVE: {
